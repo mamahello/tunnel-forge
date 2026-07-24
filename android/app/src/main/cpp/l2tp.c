@@ -261,14 +261,66 @@ static int recv_plain(int esp_fd, esp_keys_t *esp, esp_keys_t *esp_alt, int *use
   return -1;
 }
 
-static void avp_write(uint8_t *buf, size_t *off, uint16_t attr_type, const void *val, uint16_t vlen) {
-  uint16_t tot = (uint16_t)(6 + vlen);
-  uint16_t hdr = (uint16_t)(0x8000u | tot);
-  util_write_be16(buf + *off + 0, hdr);
-  util_write_be16(buf + *off + 2, 0);
-  util_write_be16(buf + *off + 4, attr_type);
-  memcpy(buf + *off + 6, val, vlen);
-  *off += 6u + vlen;
+static void avp_write_ex(
+    uint8_t *buf,
+    size_t *off,
+    uint16_t attr_type,
+    const void *val,
+    uint16_t vlen,
+    int mandatory
+) {
+    uint16_t tot = (uint16_t)(6u + vlen);
+
+    /*
+     * AVP header:
+     * bit 15 = M-bit (Mandatory)
+     * bit 14 = H-bit (Hidden)
+     * low 10 bits = total AVP length
+     */
+    uint16_t hdr = (uint16_t)(
+        (mandatory ? 0x8000u : 0u) | tot
+    );
+
+    util_write_be16(buf + *off + 0, hdr);
+    util_write_be16(buf + *off + 2, 0);          /* Vendor ID = IETF */
+    util_write_be16(buf + *off + 4, attr_type);
+    memcpy(buf + *off + 6, val, vlen);
+
+    *off += 6u + vlen;
+}
+
+static void avp_write(
+    uint8_t *buf,
+    size_t *off,
+    uint16_t attr_type,
+    const void *val,
+    uint16_t vlen
+) {
+    avp_write_ex(
+        buf,
+        off,
+        attr_type,
+        val,
+        vlen,
+        1
+    );
+}
+
+static void avp_write_optional(
+    uint8_t *buf,
+    size_t *off,
+    uint16_t attr_type,
+    const void *val,
+    uint16_t vlen
+) {
+    avp_write_ex(
+        buf,
+        off,
+        attr_type,
+        val,
+        vlen,
+        0
+    );
 }
 
 static void avp_u16(uint8_t *buf, size_t *off, uint16_t attr_type, uint16_t v) {
@@ -511,30 +563,60 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
   s_recv_plain_info_budget = 64;
   esp_reset_drop_counters();
 
-  uint16_t local_tid = 0x1001;
+  uint16_t local_tid = 1;
   s->peer_tunnel_id = local_tid;
 
   uint8_t avps[512];
   size_t ao = 0;
 
-  // RFC 2661 sec 5.2.1 SCCRQ: AVP order and mandatory set (xl2tpd rejects SCCRQ without Firmware Revision).
+  /*
+   * H3C/iNode-compatible SCCRQ.
+   *
+   * AVP order copied from the successful iNode packet:
+   *   1. Message Type
+   *   2. Protocol Version
+   *   3. Host Name = "vpn"
+   *   4. Vendor Name = "HuaWei" (optional)
+   *   5. Framing Capabilities = synchronous only
+   *   6. Assigned Tunnel ID = 1
+   *   7. Receive Window Size = 128
+   */
+
   avp_u16(avps, &ao, L2TP_AVP_MSG_TYPE, L2TP_MSG_SCCRQ);
   avp_u16(avps, &ao, 2, 0x0100); /* Protocol Version 1.0 */
-  {
-    uint8_t fc[4] = {0, 0, 0, 3};
-    avp_write(avps, &ao, 3, fc, 4);
-  } /* sync + async framing */
-  {
-    uint8_t bc[4] = {0, 0, 0, 3};
-    avp_write(avps, &ao, 4, bc, 4);
-  } /* digital + analog bearer */
-  avp_u16(avps, &ao, 6, 1); /* Firmware Revision (required) */
+
   {
     const char host[] = "vpn";
     avp_write(avps, &ao, 7, host, (uint16_t)strlen(host));
   }
-  avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_TUNNEL, local_tid);
-  avp_u16(avps, &ao, 10, 1024); /* Receive Window Size (optional; aids interop) */
+
+  {
+    const char vendor[] = "HuaWei";
+    avp_write_optional(
+        avps,
+        &ao,
+        8,
+        vendor,
+        (uint16_t)strlen(vendor));
+  }
+
+  {
+    uint8_t fc[4] = {0, 0, 0, 1};
+    avp_write(avps, &ao, 3, fc, 4);
+  } /* synchronous framing only */
+
+  avp_u16(
+      avps,
+      &ao,
+      L2TP_AVP_ASSIGNED_TUNNEL,
+      local_tid);
+
+  avp_u16(
+      avps,
+      &ao,
+      10,
+      128); /* Receive Window Size */
+
   if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
     return -1;
 
