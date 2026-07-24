@@ -530,7 +530,7 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
   } /* digital + analog bearer */
   avp_u16(avps, &ao, 6, 1); /* Firmware Revision (required) */
   {
-    const char host[] = "tunnel_forge";
+    const char host[] = "vpn";
     avp_write(avps, &ao, 7, host, (uint16_t)strlen(host));
   }
   avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_TUNNEL, local_tid);
