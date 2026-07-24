@@ -329,6 +329,18 @@ static void avp_u16(uint8_t *buf, size_t *off, uint16_t attr_type, uint16_t v) {
   avp_write(buf, off, attr_type, tmp, 2);
 }
 
+static void avp_u32(uint8_t *buf, size_t *off, uint16_t attr_type, uint32_t v) {
+  uint8_t tmp[4];
+  util_write_be32(tmp, v);
+  avp_write(buf, off, attr_type, tmp, 4);
+}
+
+static void avp_u32_optional(uint8_t *buf, size_t *off, uint16_t attr_type, uint32_t v) {
+  uint8_t tmp[4];
+  util_write_be32(tmp, v);
+  avp_write_optional(buf, off, attr_type, tmp, 4);
+}
+
 static void ingest_peer_ns(l2tp_session_t *s, uint16_t peer_ns) { s->recv_nr_expected = (uint16_t)(peer_ns + 1u); }
 
 static int esp_prepare_profile_variant(const esp_keys_t *src, esp_keys_t *dst, int swap_direction,
@@ -617,6 +629,9 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
       10,
       128); /* Receive Window Size */
 
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C L2TP: send SCCRQ host=vpn vendor=HuaWei framing=1 local_tid=%u rws=128 packet_len=%zu",
+                    (unsigned)local_tid, ao + (size_t)L2TP_CTRL_HDR);
   if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
     return -1;
 
@@ -678,14 +693,25 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
   
   s->tunnel_id = remote_tid;
   s->peer_tunnel_id = local_tid;
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C L2TP: SCCRP accepted remote_tid=%u local_tid=%u peer_ns=%u",
+                    (unsigned)remote_tid, (unsigned)local_tid, (unsigned)s->recv_nr_expected);
 
+  /* Successful iNode SCCCN contains only the mandatory Message Type AVP. */
   ao = 0;
   avp_u16(avps, &ao, L2TP_AVP_MSG_TYPE, L2TP_MSG_SCCCN);
-  avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_TUNNEL, local_tid);
   if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
     return -1;
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "H3C L2TP: SCCCN sent");
 
-  // RFC 2661: ICRQ must carry caller-assigned Session ID (AVP 14).
+  /*
+   * Match the successful iNode ICRQ:
+   * - Assigned Session ID
+   * - 32-bit Call Serial Number (same value as the local Session ID)
+   * - Bearer Type = digital + analog (3)
+   * - optional Physical Channel ID = 0
+   * - Called Number = "8888"
+   */
   uint16_t local_sid = pick_local_id(local_tid, 0x2222u);
   if (local_sid == 0)
     local_sid = 1;
@@ -693,10 +719,16 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
   ao = 0;
   avp_u16(avps, &ao, L2TP_AVP_MSG_TYPE, L2TP_MSG_ICRQ);
   avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_SESSION, local_sid);
-  avp_u16(avps, &ao, 15, 1);
-  tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG,
-                    "l2tp icrq avps: msg_type=%u assigned_session=%u call_serial=%u call_serial_width=%u",
-                    (unsigned)L2TP_MSG_ICRQ, (unsigned)local_sid, 1u, 16u);
+  avp_u32(avps, &ao, 15, (uint32_t)local_sid); /* Call Serial Number */
+  avp_u32(avps, &ao, 18, 3u);                  /* Bearer Type */
+  avp_u32_optional(avps, &ao, 25, 0u);         /* Physical Channel ID */
+  {
+    const char called_number[] = "8888";
+    avp_write(avps, &ao, 21, called_number, (uint16_t)strlen(called_number));
+  }
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C L2TP: send ICRQ local_sid=%u call_serial=%u called=8888 packet_len=%zu",
+                    (unsigned)local_sid, (unsigned)local_sid, ao + (size_t)L2TP_CTRL_HDR);
   if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
     return -1;
 
@@ -709,15 +741,30 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
 
   s->session_id = remote_sid;
   s->peer_session_id = local_sid;
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C L2TP: ICRP accepted remote_sid=%u local_sid=%u",
+                    (unsigned)remote_sid, (unsigned)local_sid);
 
+  /*
+   * Standards-compliant minimal ICCN. These are the three required AVPs and
+   * match the corresponding values in the successful iNode packet.
+   * Optional proxy-auth/LCP-history/MAC AVPs are intentionally omitted: they
+   * are not required for normal end-to-end PPP/CHAP negotiation.
+   */
   ao = 0;
   avp_u16(avps, &ao, L2TP_AVP_MSG_TYPE, L2TP_MSG_ICCN);
-  avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_SESSION, local_sid);
+  avp_u32(avps, &ao, 24, 9600u);       /* Tx Connect Speed */
+  avp_u32(avps, &ao, 19, 3u);          /* Framing Type: sync + async */
+  avp_u32_optional(avps, &ao, 38, 9600u); /* Rx Connect Speed */
   if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
     return -1;
 
-  /* Drain stray post-handshake datagram so data-plane loop does not inherit stale control noise. */
-  (void)recv_plain(esp_fd, esp, NULL, NULL, in, sizeof(in), 1500);
+  /*
+   * Do not read-and-discard the first post-ICCN datagram. H3C commonly sends
+   * the first PPP CHAP challenge immediately; PPP negotiation must receive it.
+   */
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C L2TP: ICCN sent, control/session handshake complete");
 
   tunnel_log("l2tp ok remote_tid=%u remote_sid=%u local_tid=%u local_sid=%u", (unsigned)s->tunnel_id,
              (unsigned)s->session_id, (unsigned)s->peer_tunnel_id, (unsigned)s->peer_session_id);
@@ -837,16 +884,17 @@ int l2tp_data_extract_ppp(const uint8_t *plain, size_t plain_len, const l2tp_ses
 int l2tp_send_ppp(int esp_fd, esp_keys_t *esp, const struct sockaddr *peer, socklen_t peer_len, l2tp_session_t *s,
                   const uint8_t *ppp, size_t ppp_len) {
   uint8_t pkt[4096];
-  // RFC 2661 sec 3.6: L=1 length field (8-byte header). Observed: compact (L=0) + aligned LCP could still
-  // be followed by peer control-only traffic; long header matches common xl2tpd transmit shape.
-  size_t tot = 8u + ppp_len;
+  /*
+   * H3C/iNode uses the compact RFC 2661 data header: T=0, L=0, S=0, O=0,
+   * version=2, followed directly by Tunnel ID and Session ID.
+   */
+  size_t tot = 6u + ppp_len;
   if (tot > sizeof(pkt))
     return -1;
-  util_write_be16(pkt + 0, 0x4002);
-  util_write_be16(pkt + 2, (uint16_t)tot);
-  util_write_be16(pkt + 4, s->tunnel_id);
-  util_write_be16(pkt + 6, s->session_id);
-  memcpy(pkt + 8, ppp, ppp_len);
+  util_write_be16(pkt + 0, 0x0002);
+  util_write_be16(pkt + 2, s->tunnel_id);
+  util_write_be16(pkt + 4, s->session_id);
+  memcpy(pkt + 6, ppp, ppp_len);
   return esp_encrypt_send(esp_fd, esp, peer, peer_len, pkt, tot);
 }
 

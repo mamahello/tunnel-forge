@@ -39,6 +39,10 @@ typedef enum {
   PPP_AUTH_CHAP_MD5,
 } ppp_auth_kind_t;
 
+/* H3C may transmit a CHAP challenge before LCP reaches Opened; preserve one frame for auth. */
+static uint8_t s_pending_chap_frame[512];
+static size_t s_pending_chap_frame_len;
+
 static const char *ppp_auth_name(ppp_auth_kind_t auth) {
   switch (auth) {
   case PPP_AUTH_PAP:
@@ -203,7 +207,7 @@ static int urandom_bytes(uint8_t *b, size_t n) {
 }
 
 static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t auth, uint16_t mru,
-                        int include_address_control, int include_accm, int include_auth) {
+                        uint32_t magic, int include_address_control, int include_accm, int include_auth) {
   size_t o = 0;
   if (include_address_control) {
     if (cap < 40)
@@ -213,8 +217,6 @@ static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t au
     util_write_be16(out + o, PROTO_LCP);
     o += 2;
   } else {
-    /* Peer LCP over L2TP often omits Address/Control (ACFC); runtime logs showed c0 21... then silence after
-     * our aligned CR still used ff 03. */
     if (cap < 36)
       return -1;
     util_write_be16(out + o, PROTO_LCP);
@@ -225,17 +227,25 @@ static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t au
   out[o++] = id;
   size_t len_mark = o;
   o += 2;
+
+  /* iNode starts with MRU and Magic-Number; it does not request peer auth. */
   out[o++] = 1;
   out[o++] = 4;
   util_write_be16(out + o, mru);
   o += 2;
+
+  out[o++] = 5;
+  out[o++] = 6;
+  util_write_be32(out + o, magic);
+  o += 4;
+
   if (include_accm) {
-    /* ACCM 00 00 00 00: keep this unless peer explicitly Configure-Rejects it. */
     out[o++] = 2;
     out[o++] = 6;
     util_write_be32(out + o, 0u);
     o += 4u;
   }
+
   if (include_auth) {
     out[o++] = 3;
     if (auth == PPP_AUTH_PAP) {
@@ -248,13 +258,13 @@ static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t au
       out[o++] = 0x23;
       out[o++] = 0x81;
     } else {
-      /* RFC 1994 CHAP: Authentication-Protocol 0xc223 + algorithm 0x05 (MD5-Challenge). */
       out[o++] = 5;
       out[o++] = 0xc2;
       out[o++] = 0x23;
       out[o++] = 0x05;
     }
   }
+
   util_write_be16(out + len_mark, (uint16_t)(o - code_off));
   return (int)o;
 }
@@ -292,39 +302,9 @@ static int lcp_parse_peer_auth(const uint8_t *lcp, size_t lcp_len, ppp_auth_kind
   return -1;
 }
 
-static int lcp_parse_peer_mru(const uint8_t *lcp, size_t lcp_len, uint16_t *mru_out) {
-  if (lcp_len < 6u || mru_out == NULL)
-    return -1;
-  const uint8_t *opts = lcp + 4u;
-  size_t rem = lcp_len - 4u;
-  size_t i = 0;
-  while (i + 2u <= rem) {
-    uint8_t t = opts[i];
-    uint8_t ol = opts[i + 1u];
-    if (ol < 2u || i + (size_t)ol > rem)
-      break;
-    if (t == 1u && ol >= 4u) {
-      *mru_out = ((uint16_t)opts[i + 2u] << 8) | opts[i + 3u];
-      return 0;
-    }
-    i += (size_t)ol;
-  }
-  return -1;
-}
 
-static int lcp_nak_wants_pap(const uint8_t *opt, size_t opt_len) {
-  size_t i = 0;
-  while (i + 2 <= opt_len) {
-    uint8_t t = opt[i];
-    uint8_t l = opt[i + 1];
-    if (l < 2 || i + l > opt_len)
-      break;
-    if (t == 3 && l >= 4 && opt[i + 2] == 0xc0 && opt[i + 3] == 0x23)
-      return 1;
-    i += l;
-  }
-  return 0;
-}
+
+
 
 /* Applies RFC1661 Configure-Reject payload to our outgoing Configure-Request option set. */
 /** Peer LCP Configure-Request: option type 8 = Address-and-Control-Field-Compression (RFC 1661). */
@@ -419,21 +399,26 @@ static void lcp_apply_conf_reject(const uint8_t *lcp, size_t lcp_len, int *inclu
  */
 static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr *peer, socklen_t peer_len,
                              l2tp_session_t *l2tp, ppp_auth_kind_t *auth_out, ppp_session_t *ppp) {
-  /* Local state for our Configure-Request sequence and adaptive option set. */
-  uint8_t id = 1;
-  ppp_auth_kind_t auth = PPP_AUTH_MSCHAPV2;
+  uint8_t id = 0;
+  ppp_auth_kind_t auth = PPP_AUTH_CHAP_MD5;
   uint8_t pkt[64];
   uint16_t cr_mru = (ppp != NULL && ppp->link_mtu >= 576u) ? ppp->link_mtu : 1500u;
   int lcp_out_include_ac = 1;
   int lcp_peer_framing_seen = 0;
-  int lcp_accm_in_cr = 1;
-  int lcp_auth_in_cr = 1;
-  /* Phase 1: send initial Configure-Request. */
-  int plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, 1, lcp_accm_in_cr, lcp_auth_in_cr);
+  int lcp_accm_in_cr = 0;
+  int lcp_auth_in_cr = 0;
+  uint32_t magic = 0;
+  if (urandom_bytes((uint8_t *)&magic, sizeof(magic)) != 0)
+    magic = (uint32_t)time(NULL) ^ 0x5de20700u;
+  if (magic == 0)
+    magic = 0x5de20700u;
+
+  int plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, magic, 1, lcp_accm_in_cr, lcp_auth_in_cr);
   if (plen < 0)
     return -1;
-  tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp: send Configure-Request id=%u auth=%s mru=%u", (unsigned)id,
-                    ppp_auth_name(auth), (unsigned)cr_mru);
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C PPP: send LCP Configure-Request id=%u mru=%u magic=%08x",
+                    (unsigned)id, (unsigned)cr_mru, (unsigned)magic);
   if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0) {
     tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG, "ppp lcp: send Configure-Request failed id=%u", (unsigned)id);
     return -1;
@@ -441,157 +426,126 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
 
   uint8_t in[4096];
   int got_ack = 0;
+  int got_peer_request = 0;
   int peer_cr_hex_done = 0;
-  int applied_peer_lcp_auth_hint = 0;
-  int pending_resend_cr_after_ack = 0;
-  /* Phase 2: bounded receive/process loop until our current request id is acknowledged. */
-  for (int round = 0; round < 16 && !got_ack; round++) {
+
+  for (int round = 0; round < 24 && !got_ack; round++) {
     int n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 4000);
-    if (n < 8) {
+    if (n < 6) {
       tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG, "ppp lcp: recv below minimum n=%d round=%d", n, round);
       continue;
     }
+
     const uint8_t *p = in;
     size_t len = (size_t)n;
     ppp_strip(in, (size_t)n, &p, &len);
-    if (len < 6 || util_read_be16(p) != PROTO_LCP)
+    uint16_t proto = 0;
+    size_t proto_len = 0;
+    if (ppp_read_protocol(p, len, &proto, &proto_len) != 0)
       continue;
+
+    /* H3C may send CHAP challenges before LCP is fully open; preserve the latest one. */
+    if (proto == PROTO_CHAP) {
+      if ((size_t)n <= sizeof(s_pending_chap_frame)) {
+        memcpy(s_pending_chap_frame, in, (size_t)n);
+        s_pending_chap_frame_len = (size_t)n;
+        tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG,
+                          "ppp lcp: cached early CHAP frame len=%d for auth phase", n);
+      }
+      continue;
+    }
+    if (proto != PROTO_LCP || len < proto_len + 4u)
+      continue;
+
     ppp_log_rx_summary(p, len, "lcp");
-    uint8_t code = p[2];
-    uint8_t rid = p[3];
+    uint8_t code = p[proto_len + 0u];
+    uint8_t rid = p[proto_len + 1u];
+    uint16_t lcp_len = util_read_be16(p + proto_len + 2u);
+    if (lcp_len < 4u || proto_len + (size_t)lcp_len > len)
+      continue;
+    const uint8_t *lcp_msg = p + proto_len;
+
     if (code == 1) {
-      /* Peer Configure-Request: observe framing/options, send Configure-Ack, optionally realign auth request. */
       if (!lcp_peer_framing_seen) {
         lcp_peer_framing_seen = 1;
         lcp_out_include_ac = (in[0] == 0xff && in[1] == 0x03) ? 1 : 0;
-        tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp peer raw addr_ctl=%d in0=%02x in1=%02x",
-                          lcp_out_include_ac, in[0], in[1]);
       }
       if (!peer_cr_hex_done) {
         peer_cr_hex_done = 1;
-        char hx[80];
-        size_t lim = len < 22u ? len : 22u;
+        char hx[96] = {0};
+        size_t lim = len < 28u ? len : 28u;
         for (size_t zi = 0; zi < lim; zi++)
-          snprintf(hx + zi * 3, 4, "%02x ", p[zi]);
-        tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp peer-cr first-bytes len=%zu lim=%zu: %s", len, lim, hx);
+          snprintf(hx + zi * 3, sizeof(hx) - zi * 3, "%02x ", p[zi]);
+        tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp peer-cr len=%zu hex=%s", len, hx);
       }
-      uint8_t ackbuf[256];
-      uint16_t lcp_len = util_read_be16(p + 4);
-      if (lcp_len < 4u || 2u + (size_t)lcp_len > len)
-        continue;
       if (ppp != NULL) {
-        lcp_peer_cr_note_acfc(p + 2u, (size_t)lcp_len, &ppp->lcp_acfc);
-        lcp_peer_cr_note_pfc(p + 2u, (size_t)lcp_len, &ppp->lcp_pfc);
+        lcp_peer_cr_note_acfc(lcp_msg, (size_t)lcp_len, &ppp->lcp_acfc);
+        lcp_peer_cr_note_pfc(lcp_msg, (size_t)lcp_len, &ppp->lcp_pfc);
       }
-      if (!applied_peer_lcp_auth_hint) {
-        ppp_auth_kind_t peer_auth = auth;
-        if (lcp_parse_peer_auth(p + 2u, (size_t)lcp_len, &peer_auth) == 0) {
-          applied_peer_lcp_auth_hint = 1;
-          if (peer_auth != auth) {
-            auth = peer_auth;
-            id++;
-            uint16_t peer_mru = 0;
-            (void)lcp_parse_peer_mru(p + 2u, (size_t)lcp_len, &peer_mru);
-            // Observed Configure-Reject body `03 05 c2 23 05` (CHAP) with MRU+ACCM+CHAP CR: omit
-            // Authentication-Protocol from our CR; peer already proposed CHAP in their Configure-Request.
-            lcp_auth_in_cr = 0;
-            plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, lcp_out_include_ac, lcp_accm_in_cr, lcp_auth_in_cr);
-            if (plen < 0)
-              return -1;
-            pending_resend_cr_after_ack = 1;
-            tunnel_engine_log(
-                ANDROID_LOG_DEBUG, LOG_TAG,
-                "ppp lcp: align auth to peer want=%s peer_mru=%u keep_mru=%u new Configure-Request id=%u auth_in_cr=%d",
-                ppp_auth_name(auth), (unsigned)peer_mru, (unsigned)cr_mru, (unsigned)id, lcp_auth_in_cr);
-          }
-        }
+      ppp_auth_kind_t peer_auth = auth;
+      if (lcp_parse_peer_auth(lcp_msg, (size_t)lcp_len, &peer_auth) == 0) {
+        auth = peer_auth;
+        tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "H3C PPP: peer selected auth=%s", ppp_auth_name(auth));
       }
-      size_t ack_ppp_len = 2u + (size_t)lcp_len;
+
+      uint8_t ackbuf[256];
       size_t prefix = (size_t)(p - in);
+      size_t ack_ppp_len = proto_len + (size_t)lcp_len;
       size_t total_ack = prefix + ack_ppp_len;
       if (total_ack > (size_t)n || total_ack > sizeof(ackbuf))
         continue;
       memcpy(ackbuf, in, total_ack);
-      if (util_read_be16(ackbuf + prefix) != PROTO_LCP)
-        continue;
-      ackbuf[prefix + 2u] = 2;
+      ackbuf[prefix + proto_len + 0u] = 2;
       if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, ackbuf, total_ack) < 0)
         return -1;
-      if (pending_resend_cr_after_ack) {
-        pending_resend_cr_after_ack = 0;
-        if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
-          return -1;
-        tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp: sent aligned Configure-Request id=%u bytes=%d",
-                          (unsigned)id, plen);
-      }
+      got_peer_request = 1;
       continue;
     }
+
     if (code == 2 && rid == id) {
-      /* Terminal condition: our current Configure-Request is acknowledged. */
       got_ack = 1;
       break;
     }
-    if (code == 4 && rid == id) {
-      /* Configure-Reject: remove rejected options and resend with next id. */
-      {
-        char hx[128];
-        size_t lim = len < 40u ? len : 40u;
-        for (size_t zi = 0; zi < lim; zi++)
-          snprintf(hx + zi * 3, 4, "%02x ", p[zi]);
-        tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG, "ppp lcp: Configure-Reject id=%u len=%zu hex_prefix=%s",
-                          (unsigned)rid, len, hx);
-      }
-      uint16_t lcp_len = util_read_be16(p + 4);
-      if (lcp_len >= 4u && 2u + (size_t)lcp_len <= len) {
-        int removed_accm = 0;
-        int removed_auth = 0;
-        lcp_apply_conf_reject(p + 2u, (size_t)lcp_len, &lcp_accm_in_cr, &lcp_auth_in_cr, &removed_accm, &removed_auth);
-        if (removed_accm || removed_auth) {
-          tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG,
-                            "ppp lcp: Configure-Reject removed opts accm=%d auth=%d (next CR accm=%d auth=%d)",
-                            removed_accm, removed_auth, lcp_accm_in_cr, lcp_auth_in_cr);
-        }
-      }
+
+    if (code == 3 && rid == id) {
+      ppp_auth_kind_t suggested = auth;
+      if (lcp_parse_peer_auth(lcp_msg, (size_t)lcp_len, &suggested) == 0)
+        auth = suggested;
       id++;
-      plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, lcp_out_include_ac, lcp_accm_in_cr, lcp_auth_in_cr);
-      if (plen < 0)
-        return -1;
-      tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp: resend after Configure-Reject id=%u bytes=%d",
-                        (unsigned)id, plen);
-      if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
+      plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, magic, lcp_out_include_ac,
+                          lcp_accm_in_cr, lcp_auth_in_cr);
+      if (plen < 0 || send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
         return -1;
       continue;
     }
-    if (code == 3 && rid == id) {
-      /* Configure-Nak: adopt suggested auth family and resend with next id. */
-      uint16_t lcp_len = util_read_be16(p + 4);
-      if (lcp_len >= 6 && (size_t)lcp_len <= len) {
-        if (lcp_nak_wants_pap(p + 6, (size_t)lcp_len - 6)) {
-          auth = PPP_AUTH_PAP;
-        } else {
-          auth = PPP_AUTH_CHAP_MD5;
-        }
-      } else {
-        auth = PPP_AUTH_CHAP_MD5;
-      }
+
+    if (code == 4 && rid == id) {
+      int removed_accm = 0;
+      int removed_auth = 0;
+      lcp_apply_conf_reject(lcp_msg, (size_t)lcp_len, &lcp_accm_in_cr, &lcp_auth_in_cr,
+                            &removed_accm, &removed_auth);
       id++;
-      plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, lcp_out_include_ac, lcp_accm_in_cr, lcp_auth_in_cr);
-      if (plen < 0)
+      plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, magic, lcp_out_include_ac,
+                          lcp_accm_in_cr, lcp_auth_in_cr);
+      if (plen < 0 || send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
         return -1;
-      tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp: received NAK, resend Configure-Request id=%u auth=%s",
-                        (unsigned)id, ppp_auth_name(auth));
-      if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
-        return -1;
+      continue;
     }
   }
+
   if (!got_ack) {
-    /* Round budget exhausted without Configure-Ack for our request id. */
     tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG, "ppp: LCP timeout");
     return -1;
   }
-  tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp: acked final auth=%s acfc=%d pfc=%d mru=%u",
-                    ppp_auth_name(auth), ppp != NULL ? ppp->lcp_acfc : -1, ppp != NULL ? ppp->lcp_pfc : -1,
-                    (unsigned)cr_mru);
+  if (!got_peer_request) {
+    tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG,
+                      "ppp lcp: local request acked before peer Configure-Request; auth defaults to %s",
+                      ppp_auth_name(auth));
+  }
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C PPP: LCP open auth=%s acfc=%d pfc=%d mru=%u",
+                    ppp_auth_name(auth), ppp != NULL ? ppp->lcp_acfc : -1,
+                    ppp != NULL ? ppp->lcp_pfc : -1, (unsigned)cr_mru);
   *auth_out = auth;
   return 0;
 }
@@ -639,7 +593,19 @@ static int ppp_auth_mschapv2(int esp_fd, esp_keys_t *esp, const struct sockaddr 
   uint8_t in[4096];
   tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp auth: start mschapv2");
   for (int i = 0; i < 16; i++) {
-    int n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 5000);
+    int n;
+    if (i == 0 && s_pending_chap_frame_len > 0) {
+      size_t cached_len = s_pending_chap_frame_len;
+      if (cached_len > sizeof(in))
+        cached_len = sizeof(in);
+      memcpy(in, s_pending_chap_frame, cached_len);
+      s_pending_chap_frame_len = 0;
+      n = (int)cached_len;
+      tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG,
+                        "ppp auth: consume cached CHAP frame len=%d", n);
+    } else {
+      n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 5000);
+    }
     if (n < 10)
       continue;
     const uint8_t *p = in;
@@ -723,7 +689,19 @@ static int ppp_auth_chap_md5(int esp_fd, esp_keys_t *esp, const struct sockaddr 
   uint8_t in[4096];
   tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp auth: start chap-md5");
   for (int i = 0; i < 16; i++) {
-    int n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 5000);
+    int n;
+    if (i == 0 && s_pending_chap_frame_len > 0) {
+      size_t cached_len = s_pending_chap_frame_len;
+      if (cached_len > sizeof(in))
+        cached_len = sizeof(in);
+      memcpy(in, s_pending_chap_frame, cached_len);
+      s_pending_chap_frame_len = 0;
+      n = (int)cached_len;
+      tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG,
+                        "ppp auth: consume cached CHAP frame len=%d", n);
+    } else {
+      n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 5000);
+    }
     if (n < 10)
       continue;
     const uint8_t *p = in;
@@ -772,6 +750,7 @@ static int ppp_auth_chap_md5(int esp_fd, esp_keys_t *esp, const struct sockaddr 
       ppp_strip(in, (size_t)n, &p, &len);
       if (len >= 4 && util_read_be16(p) == PROTO_CHAP && p[2] == 3) {
         ppp_log_rx_summary(p, len, "auth-chap-md5-success");
+        tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "H3C PPP: CHAP-MD5 authentication succeeded");
         return 0;
       }
       if (len >= 4 && util_read_be16(p) == PROTO_CHAP && p[2] == 4) {
@@ -946,7 +925,7 @@ static int ppp_ipcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr
   /* Re-transmit cadence when no useful IPCP progress is observed. */
   const long long resend_after_ms = 1500ll;
   /* Current outbound Configure-Request id and requested values (0.0.0.0 means "suggest/assign"). */
-  uint8_t id = 1;
+  uint8_t id = 0;
   uint8_t req_ip[4] = {0, 0, 0, 0};
   uint8_t req_primary_dns[4] = {0, 0, 0, 0};
   uint8_t req_secondary_dns[4] = {0, 0, 0, 0};
@@ -1336,6 +1315,7 @@ static size_t ppp_write_frame_prefix(uint8_t *buf, size_t cap, uint16_t proto, c
 int ppp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr *peer, socklen_t peer_len, l2tp_session_t *l2tp,
                   const char *user, const char *password, int tun_mtu, ppp_session_t *ppp) {
   memset(ppp, 0, sizeof(*ppp));
+  s_pending_chap_frame_len = 0;
   ppp->link_mtu = ppp_sanitize_link_mtu(tun_mtu);
   ppp->tcp_mss = ppp_tcp_mss_for_link_mtu(ppp->link_mtu);
   tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp negotiate: start link_mtu=%u advertised_mru=%u tcp_mss=%u",
@@ -1368,6 +1348,12 @@ int ppp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr *peer, sock
     return -1;
   }
 
+  tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                    "H3C PPP: IPCP open local=%u.%u.%u.%u peer=%u.%u.%u.%u",
+                    (unsigned)ppp->local_ip[0], (unsigned)ppp->local_ip[1],
+                    (unsigned)ppp->local_ip[2], (unsigned)ppp->local_ip[3],
+                    (unsigned)ppp->peer_ip[0], (unsigned)ppp->peer_ip[1],
+                    (unsigned)ppp->peer_ip[2], (unsigned)ppp->peer_ip[3]);
   return 0;
 }
 
