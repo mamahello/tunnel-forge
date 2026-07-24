@@ -675,10 +675,8 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
   uint16_t remote_tid = 0;
   if (l2tp_avp_first_u16(in, (size_t)ilen, L2TP_AVP_ASSIGNED_TUNNEL, &remote_tid) != 0 || remote_tid == 0)
     return -1;
-
+  
   s->tunnel_id = remote_tid;
-  if (local_tid == remote_tid)
-    local_tid = (uint16_t)(remote_tid + 1u);
   s->peer_tunnel_id = local_tid;
 
   ao = 0;
