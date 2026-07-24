@@ -1,0 +1,71 @@
+name: Build Custom TunnelForge APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android arm64 debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.2"
+          channel: stable
+          cache: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: android/gvisor/go.mod
+          cache: true
+          cache-dependency-path: android/gvisor/go.sum
+
+      - name: Show tool versions
+        run: |
+          java -version
+          flutter --version
+          go version
+          flutter doctor -v
+
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
+
+      - name: Resolve Go dependencies
+        working-directory: android/gvisor
+        run: go mod download
+
+      - name: Build arm64 debug APK
+        run: |
+          flutter build apk \
+            --debug \
+            --split-per-abi \
+            --target-platform android-arm64
+
+      - name: Verify APK
+        run: |
+          ls -lh build/app/outputs/flutter-apk/
+          test -f build/app/outputs/flutter-apk/app-arm64-v8a-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: tunnel-forge-vpn-arm64-debug
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-debug.apk
+          if-no-files-found: error
+          retention-days: 14
